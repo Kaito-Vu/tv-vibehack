@@ -27,6 +27,7 @@ public class ClockDream extends DreamService {
     private GradientDrawable glow;
     private int colorIndex;
     private int glowColor;
+    private ValueAnimator glowAnim;
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -61,6 +62,7 @@ public class ClockDream extends DreamService {
         super.onDreamingStarted();
         content.setAlpha(0f);
         content.post(() -> {
+            if (content == null) return;
             placeClock();
             content.animate().alpha(1f).setDuration(1200).start();
         });
@@ -69,14 +71,24 @@ public class ClockDream extends DreamService {
 
     @Override
     public void onDreamingStopped() {
-        handler.removeCallbacks(tick);
+        stopAnimations();
         super.onDreamingStopped();
     }
 
     @Override
     public void onDetachedFromWindow() {
-        handler.removeCallbacks(tick);
+        stopAnimations();
         super.onDetachedFromWindow();
+    }
+
+    /** Stops the timer and every running animation, so nothing keeps touching the views after the dream ends. */
+    private void stopAnimations() {
+        handler.removeCallbacks(tick);
+        if (glowAnim != null) {
+            glowAnim.cancel();
+            glowAnim = null;
+        }
+        if (content != null) content.animate().cancel();
     }
 
     private void moveClock() {
@@ -104,10 +116,11 @@ public class ClockDream extends DreamService {
     private void shiftGlow() {
         int from = glowColor;
         colorIndex = (colorIndex + 1) % PALETTE.length;
-        ValueAnimator anim = ValueAnimator.ofObject(new ArgbEvaluator(), from, PALETTE[colorIndex]);
-        anim.setDuration(8000);
-        anim.addUpdateListener(a -> setGlow((int) a.getAnimatedValue()));
-        anim.start();
+        if (glowAnim != null) glowAnim.cancel();
+        glowAnim = ValueAnimator.ofObject(new ArgbEvaluator(), from, PALETTE[colorIndex]);
+        glowAnim.setDuration(8000);
+        glowAnim.addUpdateListener(a -> setGlow((int) a.getAnimatedValue()));
+        glowAnim.start();
     }
 
     private void setGlow(int color) {

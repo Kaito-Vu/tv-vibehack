@@ -27,7 +27,9 @@ is reversible from the TV's own settings if the tools are gone.
 The launcher lives in `launcher/` and is deliberately small: plain Java, AndroidX RecyclerView and
 DynamicAnimation, no Kotlin, no Compose, no network. It targets TVs with 1 GB of RAM, so:
 
-- No blur, no video backgrounds, no polling, no background services.
+- No blur, no video backgrounds, no polling, no always-running services, no `INTERNET` permission.
+  Listen for system events only while Home is on screen (see `onStart`/`onStop` in `MainActivity`), and keep
+  slow work (package scans, image decoding) off the main thread.
 - Anything that depends on a specific TV goes in `app/src/main/res/values/config.xml`, not in code.
 - Keep D-pad navigation deterministic. Test Up/Down/Left/Right from every edge.
 - Verify on a real TV, not only the emulator. The easiest way is remote key injection plus a
@@ -39,8 +41,9 @@ build-tools 34.0.0; on macOS `brew install openjdk@17 android-commandlinetools` 
 `sdkmanager "platforms;android-34" "build-tools;34.0.0"`; with the newer command-line tools the form is
 `android sdk install platforms/android-34 build-tools/34.0.0`).
 
-Ideas that fit the direction: an idle screensaver with clock and ambient colour, per-TV icon packs
-for apps without banners, a settings screen to edit the dock from the TV, localisation.
+Ideas that fit the direction: per-TV icon packs for apps without banners, a settings screen to edit
+the dock from the TV, more languages (the Clock screensaver and six translations already exist; keep
+every `values-*/strings.xml` in step with `values/strings.xml`).
 Ideas that don't: recommendation rows, content feeds, ads, telemetry.
 
 ## 3. Improve the prompt and tools

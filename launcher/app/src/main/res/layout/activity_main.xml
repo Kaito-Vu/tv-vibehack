@@ -2,8 +2,7 @@
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/root"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:background="#FF000000">
+    android:layout_height="match_parent">
 
     <!-- Ambient glow in the colour of the focused dock app. -->
     <View

@@ -3,13 +3,28 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 : "${TV_HOST:?set TV_HOST to the TV IP address, e.g. TV_HOST=192.168.1.50 $0}"
-export JAVA_HOME="${JAVA_HOME:-$(/usr/libexec/java_home -v 17 2>/dev/null || echo /opt/homebrew/opt/openjdk@17)}"
-export ANDROID_HOME="${ANDROID_HOME:-$([ -d ~/Library/Android/sdk ] && echo ~/Library/Android/sdk || echo /opt/homebrew/share/android-commandlinetools)}"
-export PATH="$JAVA_HOME/bin:$PATH"
-[ -f local.properties ] || echo "sdk.dir=$ANDROID_HOME" > local.properties
-./gradlew assembleRelease -q --console=plain
 PY=../tools/venv/bin/python
 [ -x "$PY" ] || PY=../tools/venv/Scripts/python.exe
+[ -x "$PY" ] || { echo "ERROR: run first: python3 -m venv tools/venv && tools/venv/bin/pip install -r tools/requirements.txt" >&2; exit 1; }
+# JDK 17 and the Android SDK: use what the environment names, else look in the usual macOS and Linux
+# places. Never point JAVA_HOME at a directory that is not there; Gradle refuses to start on that.
+if [ -z "${JAVA_HOME:-}" ]; then
+  for c in "$(/usr/libexec/java_home -v 17 2>/dev/null || true)" /opt/homebrew/opt/openjdk@17 \
+           /usr/lib/jvm/java-17-openjdk-amd64 /usr/lib/jvm/java-17-openjdk; do
+    if [ -n "$c" ] && [ -x "$c/bin/java" ]; then JAVA_HOME=$c; break; fi
+  done
+fi
+if [ -n "${JAVA_HOME:-}" ]; then export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"; fi   # otherwise java from PATH
+if [ -z "${ANDROID_HOME:-}" ]; then
+  for c in ~/Library/Android/sdk ~/Android/Sdk /opt/homebrew/share/android-commandlinetools /usr/lib/android-sdk; do
+    if [ -d "$c/platforms" ]; then ANDROID_HOME=$c; break; fi
+  done
+fi
+if [ ! -f local.properties ]; then
+  [ -n "${ANDROID_HOME:-}" ] || { echo "ERROR: Android SDK not found. Set ANDROID_HOME (see CONTRIBUTING.md)." >&2; exit 1; }
+  echo "sdk.dir=$ANDROID_HOME" > local.properties
+fi
+./gradlew assembleRelease -q --console=plain
 export MSYS_NO_PATHCONV=1
 # Which app owns Home differs by build (com.google.android.tvlauncher on Android TV,
 # com.google.android.apps.tv.launcherx on newer Google TV), so ask the TV instead of guessing.
@@ -41,9 +56,20 @@ if [ "$STOCK_LAUNCHER" = none ]; then DISABLE_STOCK="echo stock launcher left al
 else DISABLE_STOCK="pm disable-user --user 0 $STOCK_LAUNCHER"; fi
 APK=app/build/outputs/apk/release/app-release.apk
 "$PY" -I ../tools/b64push.py "$APK" /data/local/tmp/tvhome.apk
+# Install on its own and look at the answer: the batch below never reads what the TV says, and the
+# stock launcher must stay untouched unless the new one is really there.
+INSTALL_OUT=$("$PY" -I ../tools/tv.py 'pm install -r /data/local/tmp/tvhome.apk; rm -f /data/local/tmp/tvhome.apk' | tr -d '\r')
+echo "$INSTALL_OUT"
+case "$INSTALL_OUT" in
+  *Success*) ;;
+  *)
+    echo "ERROR: pm install failed; the stock launcher was left untouched." >&2
+    case "$INSTALL_OUT" in
+      *UPDATE_INCOMPATIBLE*) echo "An older build signed with a different key is installed. Remove it first (tools/tv.py 'pm uninstall com.gathin.tvhome'), then run this script again." >&2 ;;
+    esac
+    exit 1 ;;
+esac
 printf '%s\n' \
-  "pm install -r /data/local/tmp/tvhome.apk" \
-  "rm -f /data/local/tmp/tvhome.apk" \
   "pm grant com.gathin.tvhome android.permission.ACCESS_FINE_LOCATION 2>/dev/null; echo location-granted" \
   "cmd package compile -m speed -f com.gathin.tvhome" \
   "am start -W -n com.gathin.tvhome/.MainActivity | grep -E '^(Status|Error)'" \

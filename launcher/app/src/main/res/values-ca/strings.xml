@@ -4,9 +4,7 @@
     <string name="inputs">Entrades</string>
     <string name="wifi">Wi-Fi</string>
     <string name="settings">Configuració</string>
-    <string name="choose_input">Entrades</string>
     <string name="connected">Connectat</string>
-    <string name="standby">En espera</string>
     <string name="not_connected">Cap dispositiu</string>
     <string name="live_tv">TV en directe</string>
     <string name="no_inputs">No s\'ha trobat cap entrada</string>
@@ -19,4 +17,10 @@
     <string name="not_available">No disponible en aquest televisor</string>
     <string name="cant_open">No s\'ha pogut obrir %1$s</string>
     <string name="dream_name">Rellotge</string>
+    <string name="date_format">EEEE d MMMM</string>
+    <string name="home_key_name">Botó Inici</string>
+    <string name="home_key_description">Fa que el botó Inici del comandament obri aquest llançador.</string>
+    <string name="home_settings">Inici per defecte</string>
+    <string name="home_settings_help">Trieu una pantalla d\'inici a la configuració del sistema i premeu Inici.</string>
+    <string name="input_key_service_description">Obre el selector d\'entrades quan es prem el botó d\'entrada del comandament.</string>
 </resources>

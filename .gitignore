@@ -8,3 +8,9 @@ launcher/local.properties
 # your own TV's dumps (serial, android_id, device names) stay local
 backup/
 .DS_Store
+# Android Studio, and signing material if you ever add a release key
+.idea/
+*.iml
+captures/
+*.keystore
+keystore.properties

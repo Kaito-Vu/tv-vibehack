@@ -4,9 +4,7 @@
     <string name="inputs">Quellen</string>
     <string name="wifi">WLAN</string>
     <string name="settings">Einstellungen</string>
-    <string name="choose_input">Quellen</string>
     <string name="connected">Verbunden</string>
-    <string name="standby">Standby</string>
     <string name="not_connected">Kein Gerät</string>
     <string name="live_tv">Live TV</string>
     <string name="no_inputs">Keine Quellen gefunden</string>
@@ -21,4 +19,8 @@
     <string name="date_format">EEEE, d. MMMM</string>
     <string name="dream_name">Uhr</string>
     <string name="input_key_service_description">Öffnet die Quellenauswahl, wenn die Input-Taste der Fernbedienung gedrückt wird.</string>
+    <string name="home_key_name">Home-Taste</string>
+    <string name="home_key_description">Lässt die Home-Taste der Fernbedienung diesen Launcher öffnen.</string>
+    <string name="home_settings">Standard-Startbildschirm</string>
+    <string name="home_settings_help">Wähle in den Systemeinstellungen einen Startbildschirm und drücke dann Home.</string>
 </resources>

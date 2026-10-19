@@ -18,5 +18,9 @@ if (-not $TvHost) { throw 'pass -TvHost <tv ip> or set $env:TV_HOST' }
 $env:TV_HOST = $TvHost
 
 $pkgs = Get-Content $List | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ }
+# Each name ends up inside a shell command on the TV, so refuse the whole list unless every line is a package name.
+$bad = @($pkgs | Where-Object { $_ -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$' })
+if ($bad.Count) { throw "not package names, nothing was sent to the TV: $($bad -join ', ')" }
+if (-not $pkgs) { throw "$List lists no packages (every line is a comment or blank)" }
 $cmds = @($pkgs | ForEach-Object { "pm disable-user --user 0 $_" }) + 'pm list packages -d'
 $cmds | & $py -I (Join-Path $repo 'tools\tv.py') --batch

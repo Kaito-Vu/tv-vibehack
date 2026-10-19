@@ -2,10 +2,13 @@ package com.gathin.tvhome;
 
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
@@ -19,16 +22,19 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.util.Log;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.view.animation.AnimationUtils;
 import android.view.animation.LayoutAnimationController;
 import android.widget.FrameLayout;
@@ -94,17 +100,39 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private static String lastFocusedKey;
     private float density;
 
+    private static final String TAG = "TvHome";
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private PopupWindow inputsPopup;
+    /** Between onResume and onPause; tells "Home pressed while already here" from "coming back from an app". */
+    private boolean resumed;
+    /** The tile entrance animation plays once, not on every return from an app. */
+    private boolean firstShow = true;
+    private RecyclerView.OnScrollListener pendingFocus;
+    private boolean netCallbacksRegistered, inputCallbackRegistered;
+    private final Runnable wifiUpdate = this::updateWifiLabel;
+
     /** Refreshes the network pill when the connection changes: at boot Wi-Fi often connects after Home is shown. */
-    private final ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
+    private final class StatusCallback extends ConnectivityManager.NetworkCallback {
         @Override
         public void onAvailable(@NonNull Network network) {
-            handler.post(MainActivity.this::updateWifiLabel);
+            scheduleWifiUpdate();
         }
 
         @Override
         public void onLost(@NonNull Network network) {
-            handler.post(MainActivity.this::updateWifiLabel);
+            scheduleWifiUpdate();
+        }
+    }
+
+    // A callback object can only be registered once, so the default-network and the VPN request each get one.
+    private final ConnectivityManager.NetworkCallback networkCallback = new StatusCallback();
+    private final ConnectivityManager.NetworkCallback vpnCallback = new StatusCallback();
+
+    /** Marks the app list stale when anything is installed, removed or changed, so Home needn't rescan on every return. */
+    private final BroadcastReceiver packageReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (adapter != null) adapter.markDirty();
         }
     };
     /** Shows the Inputs pill once the TV registers an input: at boot HDMI inputs can appear after Home is shown. */
@@ -117,18 +145,6 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         @Override
         public void onInputRemoved(String inputId) {
             updateInputsButton();
-        }
-    };
-    /** Listens for any VPN coming up or going down, even one this app's traffic is excluded from. */
-    private final ConnectivityManager.NetworkCallback vpnCallback = new ConnectivityManager.NetworkCallback() {
-        @Override
-        public void onAvailable(@NonNull Network network) {
-            handler.post(MainActivity.this::updateWifiLabel);
-        }
-
-        @Override
-        public void onLost(@NonNull Network network) {
-            handler.post(MainActivity.this::updateWifiLabel);
         }
     };
     private final Runnable minuteTick = new Runnable() {
@@ -154,7 +170,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         sourcePanelAction = cfg.sourcePanelAction;
 
         root = findViewById(R.id.root);
-        root.setBackgroundColor(cfg.backgroundColor);
+        // On the window, not the root view: one fill of the screen instead of two stacked ones.
+        getWindow().setBackgroundDrawable(new ColorDrawable(cfg.backgroundColor));
         if (cfg.wallpaper != null) showWallpaper(cfg.wallpaper);
         glass = findViewById(R.id.glass);
         ambient = findViewById(R.id.ambient);
@@ -263,91 +280,229 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             if (!onTile) hideGlass();
         });
 
-        ConnectivityManager cm = getSystemService(ConnectivityManager.class);
-        TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
-        if (tim != null) tim.registerCallback(inputCallback, handler);
-        if (cm != null) {
-            cm.registerDefaultNetworkCallback(networkCallback);
-            cm.registerNetworkCallback(new NetworkRequest.Builder()
-                    .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
-                    .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                    .build(), vpnCallback);
+        try {
+            IntentFilter pkgs = new IntentFilter();
+            pkgs.addAction(Intent.ACTION_PACKAGE_ADDED);
+            pkgs.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            pkgs.addAction(Intent.ACTION_PACKAGE_CHANGED);
+            pkgs.addAction(Intent.ACTION_PACKAGE_REPLACED);
+            pkgs.addDataScheme("package");
+            // System broadcasts: the flag only satisfies Android 13+, which wants one on every registration.
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(packageReceiver, pkgs, Context.RECEIVER_EXPORTED);
+            else registerReceiver(packageReceiver, pkgs);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "package receiver not registered", e);
+            adapter.markDirty();
         }
     }
 
+    @Override
+    protected void onStart() {
+        super.onStart();
+        // Listen only while Home is on screen: a callback that outlives onStop wakes this process on every
+        // network change while the user is watching something else. Each registration is guarded so a
+        // refused one can never crash the home screen into a restart loop.
+        ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+        if (cm != null && !netCallbacksRegistered) {
+            try {
+                cm.registerDefaultNetworkCallback(networkCallback);
+                try {
+                    cm.registerNetworkCallback(new NetworkRequest.Builder()
+                            .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                            .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                            .build(), vpnCallback);
+                    netCallbacksRegistered = true;
+                } catch (RuntimeException e) {
+                    cm.unregisterNetworkCallback(networkCallback);
+                    throw e;
+                }
+            } catch (RuntimeException e) {
+                Log.w(TAG, "network callbacks not registered; the pill refreshes once a minute instead", e);
+            }
+        }
+        TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
+        if (tim != null && !inputCallbackRegistered) {
+            try {
+                tim.registerCallback(inputCallback, handler);
+                inputCallbackRegistered = true;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "input callback not registered", e);
+            }
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+        if (cm != null && netCallbacksRegistered) {
+            netCallbacksRegistered = false;
+            try {
+                cm.unregisterNetworkCallback(networkCallback);
+            } catch (RuntimeException ignored) {
+            }
+            try {
+                cm.unregisterNetworkCallback(vpnCallback);
+            } catch (RuntimeException ignored) {
+            }
+        }
+        TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
+        if (tim != null && inputCallbackRegistered) {
+            inputCallbackRegistered = false;
+            try {
+                tim.unregisterCallback(inputCallback);
+            } catch (RuntimeException ignored) {
+            }
+        }
+        handler.removeCallbacks(wifiUpdate);
+    }
+
     /**
-     * A theme's full-screen picture behind everything. Decoded once, downsampled to the screen so a 4K
-     * JPEG costs a 1080p bitmap at most (about 8 MB), which is the price of a wallpaper on a 1 GB TV.
+     * A theme's full-screen picture behind everything. Decoded once off the main thread (a 4K JPEG takes
+     * a while on a weak CPU) and faded in when ready, downsampled so it never costs more than about 4
+     * megabytes at RGB_565 on a 1080p screen; the plain colour shows until then.
      */
     private void showWallpaper(File file) {
-        try {
-            android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
-            android.graphics.BitmapFactory.Options opts = new android.graphics.BitmapFactory.Options();
-            opts.inJustDecodeBounds = true;
-            android.graphics.BitmapFactory.decodeFile(file.getPath(), opts);
-            int sample = 1;
-            while (opts.outWidth / (sample * 2) >= dm.widthPixels && opts.outHeight / (sample * 2) >= dm.heightPixels) sample *= 2;
-            opts.inJustDecodeBounds = false;
-            opts.inSampleSize = sample;
-            opts.inPreferredConfig = android.graphics.Bitmap.Config.RGB_565;   // no alpha needed, half the memory
-            android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeFile(file.getPath(), opts);
-            if (bmp == null) return;
-            android.widget.ImageView wall = new android.widget.ImageView(this);
-            wall.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP);
-            wall.setImageBitmap(bmp);
-            root.addView(wall, 0, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        } catch (Exception | OutOfMemoryError e) {
-            // A bad or huge picture must never take the home screen down; the plain colour stays.
-        }
+        final android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        new Thread(() -> {
+            try {
+                android.graphics.BitmapFactory.Options opts = new android.graphics.BitmapFactory.Options();
+                opts.inJustDecodeBounds = true;
+                android.graphics.BitmapFactory.decodeFile(file.getPath(), opts);
+                if (opts.outWidth <= 0 || opts.outHeight <= 0) return;
+                int sample = 1;
+                // Keep at least screen resolution along both axes...
+                while (opts.outWidth / (sample * 2) >= dm.widthPixels && opts.outHeight / (sample * 2) >= dm.heightPixels) sample *= 2;
+                // ...but cap the pixel count, so an extreme aspect ratio can't slip through that test.
+                while ((long) (opts.outWidth / sample) * (opts.outHeight / sample) > 2L * dm.widthPixels * dm.heightPixels) sample *= 2;
+                opts.inJustDecodeBounds = false;
+                opts.inSampleSize = sample;
+                opts.inPreferredConfig = android.graphics.Bitmap.Config.RGB_565;   // no alpha needed, half the memory
+                final android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeFile(file.getPath(), opts);
+                if (bmp == null) return;
+                runOnUiThread(() -> {
+                    if (isDestroyed()) return;
+                    ImageView wall = new ImageView(this);
+                    wall.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                    wall.setImageBitmap(bmp);
+                    wall.setAlpha(0f);
+                    root.addView(wall, 0, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                    wall.animate().alpha(1f).setDuration(300).start();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                Log.w(TAG, "wallpaper skipped: " + e);   // a bad picture must never take Home down; the colour stays
+            }
+        }, "tvhome-wallpaper").start();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
         glassShown = false;
         glass.setAlpha(0f);
         heroShown = false;
+        heroName.animate().cancel();
         heroName.setAlpha(0f);
+        ambient.animate().cancel();
         ambient.setAlpha(0f);
-        // Read these before reload(): rebinding can move focus to the first tile and overwrite them.
-        final String returnKey = lastFocusedKey;
-        final int returnSlot = lastFocused;
-        adapter.reload();
-        grid.scheduleLayoutAnimation();
         updateGreeting();
         updateWifiLabel();
         updateInputsButton();
+        handler.removeCallbacks(minuteTick);
         handler.postDelayed(minuteTick, MINUTE_MS);
 
+        // Read these before reload(): rebinding can move focus to the first tile and overwrite them.
+        final String returnKey = lastFocusedKey;
+        final int returnSlot = lastFocused;
         // Return to the app we left from, or the same slot if that app is gone. Always refocus: after
-        // reload() the view that holds focus may no longer show the app it had.
-        grid.post(() -> {
+        // a reload the view that holds focus may no longer show the app it had.
+        final Runnable focusNow = () -> {
             int pos = adapter.positionOf(returnKey);
             focusTile(pos >= 0 ? pos : returnSlot);
-        });
+        };
+        if (adapter.isDirty() || adapter.getItemCount() == 0) {
+            // Only rescan the apps when something was installed, removed or changed (see packageReceiver);
+            // the scan runs in the background and the tiles appear when it finishes.
+            adapter.reload(() -> {
+                if (isDestroyed()) return;
+                if (firstShow && adapter.getItemCount() > 0) {
+                    grid.scheduleLayoutAnimation();   // the entrance animation plays once, not on every return
+                    firstShow = false;
+                }
+                // The new tiles are laid out in the next frame; focusing before that finds no views.
+                afterNextDraw(focusNow);
+            });
+        } else {
+            grid.post(focusNow);
+        }
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        resumed = false;
+        dismissInputs();
         handler.removeCallbacks(minuteTick);
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // Home pressed while Home is already showing: close the menu and go back to the dock. (Coming back
+        // from another app also arrives here, but then onResume restores the tile we left from.)
+        if (resumed) {
+            dismissInputs();
+            focusTile(0);
+        }
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        ConnectivityManager cm = getSystemService(ConnectivityManager.class);
-        TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
-        if (tim != null) tim.unregisterCallback(inputCallback);
-        if (cm != null) {
-            cm.unregisterNetworkCallback(networkCallback);
-            cm.unregisterNetworkCallback(vpnCallback);
+        try {
+            unregisterReceiver(packageReceiver);
+        } catch (RuntimeException ignored) {
         }
+        handler.removeCallbacksAndMessages(null);
+        adapter.shutdown();
     }
 
     @Override
     public void onBackPressed() {
         // Home screen: Back goes nowhere.
+    }
+
+    /** Runs {@code r} once, right after the next layout pass (pre-draw runs after layout, before the frame is drawn). */
+    private void afterNextDraw(Runnable r) {
+        final ViewTreeObserver vto = grid.getViewTreeObserver();
+        vto.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                ViewTreeObserver now = grid.getViewTreeObserver();
+                if (now.isAlive()) now.removeOnPreDrawListener(this);
+                r.run();
+                return true;
+            }
+        });
+        grid.requestLayout();   // make sure there is a frame coming even if nothing else changed
+    }
+
+    private void dismissInputs() {
+        if (inputsPopup != null) {
+            try {
+                inputsPopup.dismiss();
+            } catch (RuntimeException ignored) {
+            }
+            inputsPopup = null;
+        }
+    }
+
+    private void scheduleWifiUpdate() {
+        // A burst of callbacks (Wi-Fi plus VPN coming up) becomes one update, once the framework's list of networks has settled.
+        handler.removeCallbacks(wifiUpdate);
+        handler.postDelayed(wifiUpdate, 400);
     }
 
     // ---- glass highlight -------------------------------------------------------------------------
@@ -407,6 +562,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         int color = adapter.ambientColorAt(position);
         float y = dockTopInRoot - 14 * density - 26 * density - heroName.getHeight();
         boolean changed = !label.contentEquals(heroName.getText());
+        heroName.animate().cancel();   // a cancelled animation skips its end action, so no stale label gets set later
 
         if (!heroShown) {
             heroName.setText(label);
@@ -414,7 +570,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             heroName.setTranslationX(0f);
             heroName.animate().alpha(1f).setDuration(260).start();
             setAmbient(color);
-            ambient.animate().alpha(1f).setDuration(600).start();
+            ambient.animate().alpha(1f).setDuration(600).withLayer().start();
             heroShown = true;
         } else if (changed) {
             heroName.animate().alpha(0f).translationX(-12 * density).setDuration(120).withEndAction(() -> {
@@ -424,13 +580,16 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                 heroName.animate().alpha(1f).translationX(0f).setDuration(200).start();
             }).start();
             if (color != ambientColor) {
-                ambient.animate().alpha(0.35f).setDuration(200).withEndAction(() -> {
+                ambient.animate().alpha(0.35f).setDuration(200).withLayer().withEndAction(() -> {
                     setAmbient(color);
-                    ambient.animate().alpha(1f).setDuration(500).start();
+                    ambient.animate().alpha(1f).setDuration(500).withLayer().start();
                 }).start();
             }
         } else {
             heroName.setY(y);
+            if (heroName.getAlpha() < 1f || heroName.getTranslationX() != 0f) {   // a cancelled fade left it half way
+                heroName.animate().alpha(1f).translationX(0f).setDuration(120).start();
+            }
         }
     }
 
@@ -444,7 +603,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (!heroShown) return;
         heroShown = false;
         heroName.animate().alpha(0f).setDuration(160).start();
-        ambient.animate().alpha(0f).setDuration(300).start();
+        ambient.animate().alpha(0f).setDuration(300).withLayer().start();
     }
 
     private void hideGlass() {
@@ -490,18 +649,34 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             else card.requestFocus();
             return;
         }
-        // Not laid out yet: scroll there, then focus once the scroll settles.
-        grid.addOnScrollListener(new RecyclerView.OnScrollListener() {
+        // Not laid out yet: scroll there, then focus once the scroll settles. Only one such request lives
+        // at a time, and it never pulls focus back from the top bar if the user has moved on meanwhile.
+        cancelPendingFocus();
+        pendingFocus = new RecyclerView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(@NonNull RecyclerView rv, int newState) {
                 if (newState != RecyclerView.SCROLL_STATE_IDLE) return;
-                rv.removeOnScrollListener(this);
+                cancelPendingFocus();
+                View current = getCurrentFocus();
+                if (current != null && current.getId() != R.id.card) return;
                 RecyclerView.ViewHolder h = rv.findViewHolderForAdapterPosition(pos);
                 View target = h != null ? h.itemView.findViewById(R.id.card) : rv.getChildAt(0);
                 if (target != null) target.requestFocus();
             }
-        });
+        };
+        grid.addOnScrollListener(pendingFocus);
         grid.smoothScrollToPosition(pos);
+        final RecyclerView.OnScrollListener mine = pendingFocus;
+        handler.postDelayed(() -> {   // the scroll never started: don't leave the listener behind
+            if (pendingFocus == mine) cancelPendingFocus();
+        }, 2000);
+    }
+
+    private void cancelPendingFocus() {
+        if (pendingFocus != null) {
+            grid.removeOnScrollListener(pendingFocus);
+            pendingFocus = null;
+        }
     }
 
     // ---- top bar ---------------------------------------------------------------------------------
@@ -578,11 +753,15 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         boolean any = liveTvIntent() != null || !sourcePanelService.isEmpty();
         TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
         if (!any && tim != null) {
-            for (TvInputInfo info : tim.getTvInputList()) {
-                if (info.isPassthroughInput()) {
-                    any = true;
-                    break;
+            try {
+                for (TvInputInfo info : tim.getTvInputList()) {
+                    if (info.isPassthroughInput()) {
+                        any = true;
+                        break;
+                    }
                 }
+            } catch (RuntimeException e) {
+                Log.w(TAG, "could not list TV inputs", e);   // some firmware refuses; hide the pill rather than crash Home
             }
         }
         btnInputs.setVisibility(any ? View.VISIBLE : View.GONE);
@@ -593,6 +772,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (liveTvPkg.isEmpty()) return null;
         Intent i = getPackageManager().getLeanbackLaunchIntentForPackage(liveTvPkg);
         if (i != null || liveTvAction.isEmpty()) return i;
+        // A theme can set this action, and an overlay on old Android may be writable by other apps, so only
+        // start it in a system app (the Live TV app is one).
+        if (!isSystemPackage(liveTvPkg)) return null;
         Intent byAction = new Intent(liveTvAction).setPackage(liveTvPkg);
         return getPackageManager().resolveActivity(byAction, 0) != null ? byAction : null;
     }
@@ -601,11 +783,21 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private void openSourcePanel() {
         Intent i = new Intent(sourcePanelAction);
         ComponentName c = ComponentName.unflattenFromString(sourcePanelService);
-        if (c != null) i.setComponent(c);
         try {
+            // Same reason as liveTvIntent(): never start another user app's service from a config value.
+            if (c == null || !isSystemPackage(c.getPackageName())) throw new SecurityException("not a system service");
+            i.setComponent(c);
             startService(i);
         } catch (Exception e) {
             Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private boolean isSystemPackage(String pkg) {
+        try {
+            return (getPackageManager().getApplicationInfo(pkg, 0).flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
         }
     }
 
@@ -613,13 +805,23 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
             startActivity(i);
-        } catch (ActivityNotFoundException e) {
+        } catch (ActivityNotFoundException | SecurityException e) {
             Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
         }
     }
 
     /** Dropdown menu under the Inputs pill: HDMI ports (with connection state), AV and Live TV. */
     private void showInputs() {
+        try {
+            buildAndShowInputs();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "inputs menu failed", e);
+            Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void buildAndShowInputs() {
+        dismissInputs();
         View anchor = findViewById(R.id.btnInputs);
         View panel = getLayoutInflater().inflate(R.layout.popup_inputs, root, false);
         LinearLayout rows = panel.findViewById(R.id.rows);
@@ -627,6 +829,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         // Compact: as wide as the Inputs pill (a touch wider so "HDMI 1" fits), hanging right below it.
         int width = Math.max(anchor.getWidth(), (int) (150 * density));
         final PopupWindow popup = new PopupWindow(panel, width, ViewGroup.LayoutParams.WRAP_CONTENT, true);
+        inputsPopup = popup;
         popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));   // needed for Back to dismiss
         popup.setOutsideTouchable(true);
         popup.setAnimationStyle(0);
@@ -654,7 +857,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             }
             boolean hdmiStateBogus = hdmiPorts > 1 && hdmiConnected == hdmiPorts;
             for (TvInputInfo info : inputs) {
-                if (info.getType() == TvInputInfo.TYPE_TUNER
+                if (info.getType() == TvInputInfo.TYPE_TUNER && info.getServiceInfo() != null
                         && (info.getServiceInfo().applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) {
                     // Prefer a hardware tuner: the framework names those ".../HW<n>". System apps such as
                     // AirPlay also register software inputs of type TUNER and may sort first (seen on TCL G05).
@@ -694,7 +897,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             addInputRow(rows, popup, R.drawable.ic_livetv, getString(R.string.live_tv), -1, () -> open(liveTvIntent));
         }
         if (rows.getChildCount() == 0) {
+            inputsPopup = null;
             Toast.makeText(this, R.string.no_inputs, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (isFinishing() || isDestroyed()) {
+            inputsPopup = null;
             return;
         }
 

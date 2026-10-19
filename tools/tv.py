@@ -25,9 +25,16 @@ KEY = os.path.join(KEYDIR, "adbkey")
 
 
 def get_signer():
-    os.makedirs(KEYDIR, exist_ok=True)
-    if not os.path.exists(KEY):
+    # The private key lets whoever holds it open a shell on every TV that was told "always allow",
+    # so keep it to the current user.
+    os.makedirs(KEYDIR, mode=0o700, exist_ok=True)
+    if not (os.path.exists(KEY) and os.path.exists(KEY + ".pub")):
         keygen(KEY)
+    try:
+        os.chmod(KEY, 0o600)
+        os.chmod(KEY + ".pub", 0o644)
+    except OSError:
+        pass  # Windows has no POSIX modes
     with open(KEY) as f:
         priv = f.read()
     with open(KEY + ".pub") as f:
@@ -37,12 +44,23 @@ def get_signer():
 
 def connect(timeout=120):
     dev = AdbDeviceTcp(HOST, PORT, default_transport_timeout_s=float(timeout))
-    dev.connect(rsa_keys=[get_signer()], transport_timeout_s=float(timeout), auth_timeout_s=timeout)
+    try:
+        dev.connect(rsa_keys=[get_signer()], transport_timeout_s=float(timeout), auth_timeout_s=timeout)
+    except OSError as e:
+        sys.exit(f"Could not connect to the TV at {HOST}:{PORT} ({e}).\n"
+                 "Check TV_HOST, that the TV is on and on the same Wi-Fi, and that USB/network debugging is enabled.")
+    except Exception as e:  # adb_shell raises its own types for refused or timed-out authorisation
+        sys.exit(f"Connected to {HOST}:{PORT} but the TV did not accept this computer ({type(e).__name__}: {e}).\n"
+                 "Look for the 'Allow USB debugging?' prompt on the TV and accept it.")
     return dev
 
 
 def main():
     args = sys.argv[1:]
+    if args and args[0].startswith("--") and args[0] not in ("--probe", "--push", "--pull", "--batch"):
+        sys.exit(__doc__)
+    if args and args[0] in ("--push", "--pull") and len(args) != 3:
+        sys.exit(__doc__)
     dev = connect()
     if not args or args == ["--probe"]:
         for p in ("ro.product.model", "ro.product.device", "ro.build.version.release",

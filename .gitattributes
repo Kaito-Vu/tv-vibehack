@@ -1,0 +1,4 @@
+# Shell and Python scripts must keep LF: a CRLF after "#!/usr/bin/env bash" stops them running on macOS and Linux.
+*.sh    text eol=lf
+*.py    text eol=lf
+gradlew text eol=lf

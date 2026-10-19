@@ -4,9 +4,7 @@
     <string name="inputs">Entradas</string>
     <string name="wifi">Wi-Fi</string>
     <string name="settings">Ajustes</string>
-    <string name="choose_input">Entradas</string>
     <string name="connected">Conectado</string>
-    <string name="standby">En espera</string>
     <string name="not_connected">Sin dispositivo</string>
     <string name="live_tv">TV en vivo</string>
     <string name="no_inputs">No se encontraron entradas</string>
@@ -20,4 +18,9 @@
     <string name="cant_open">No se puede abrir %1$s</string>
     <string name="date_format">EEEE d \'de\' MMMM</string>
     <string name="dream_name">Reloj</string>
+    <string name="home_key_name">Botón Inicio</string>
+    <string name="home_key_description">Hace que el botón Inicio del mando abra este launcher.</string>
+    <string name="home_settings">Inicio predeterminado</string>
+    <string name="home_settings_help">Elige una pantalla de inicio en los ajustes del sistema y pulsa Inicio.</string>
+    <string name="input_key_service_description">Abre el selector de entradas al pulsar el botón de entrada del mando.</string>
 </resources>

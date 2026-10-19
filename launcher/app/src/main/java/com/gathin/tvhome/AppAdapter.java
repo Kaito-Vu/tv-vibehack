@@ -13,6 +13,8 @@ import android.graphics.Outline;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
@@ -28,11 +30,15 @@ import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * App tiles. The first {@link MainActivity#COLUMNS} positions are the pinned dock (favourites, fixed order),
@@ -53,14 +59,20 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         final String pkg;
         final Drawable banner;
         final Drawable icon;
+        /** component.flattenToShortString(), computed once: it allocates, and lookups happen on every key press. */
+        final String key;
+        /** Unique for the life of the adapter; a String hash could collide and crash RecyclerView. */
+        final long id;
         int ambient;
 
-        Entry(String label, ComponentName component, Drawable banner, Drawable icon) {
+        Entry(String label, ComponentName component, Drawable banner, Drawable icon, String key, long id) {
             this.label = label;
             this.component = component;
             this.pkg = component.getPackageName();
             this.banner = banner;
             this.icon = icon;
+            this.key = key;
+            this.id = id;
         }
     }
 
@@ -98,6 +110,12 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
     private final Set<String> hidden;
     private final boolean showHomeSettings;
     private final List<Entry> items = new ArrayList<>();
+    private final Map<String, Long> ids = new HashMap<>();   // worker thread only
+    private long nextId = 1;                                  // worker thread only
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final Handler main = new Handler(Looper.getMainLooper());
+    /** True until the list has been built, and again whenever a package is added, removed or changed. */
+    private volatile boolean dirty = true;
 
     AppAdapter(Context ctx, TileListener listener, int dockSize, Config cfg) {
         this.ctx = ctx;
@@ -111,7 +129,51 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         setHasStableIds(true);
     }
 
-    void reload() {
+    /** Marks the list stale; the next {@link #reload} rebuilds it. Safe to call from any thread. */
+    void markDirty() {
+        dirty = true;
+    }
+
+    boolean isDirty() {
+        return dirty;
+    }
+
+    /** Stops the background loader. Call from Activity.onDestroy. */
+    void shutdown() {
+        worker.shutdownNow();
+    }
+
+    /**
+     * Rebuilds the app list off the main thread (a PackageManager query plus a banner, icon and label
+     * per app is too slow for a weak TV CPU), then swaps it in on the main thread and runs {@code done}.
+     * {@code done} also runs when the build fails, so callers can always restore focus.
+     */
+    void reload(Runnable done) {
+        dirty = false;
+        try {
+            worker.execute(() -> {
+                List<Entry> fresh = null;
+                try {
+                    fresh = build();
+                } catch (RuntimeException e) {
+                    dirty = true;   // try again next time instead of showing a half-built list
+                }
+                final List<Entry> result = fresh;
+                main.post(() -> {
+                    if (result != null) {
+                        items.clear();
+                        items.addAll(result);
+                        notifyDataSetChanged();
+                    }
+                    if (done != null) done.run();
+                });
+            });
+        } catch (RejectedExecutionException e) {
+            // Shut down with the activity; nothing to show.
+        }
+    }
+
+    private List<Entry> build() {
         PackageManager pm = ctx.getPackageManager();
         Intent probe = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
         List<ResolveInfo> found = pm.queryIntentActivities(probe, 0);
@@ -122,9 +184,10 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
             if (pkg.equals(ctx.getPackageName()) || hidden.contains(pkg)) continue;
             Drawable banner = ri.activityInfo.loadBanner(pm);
             if (banner == null) banner = ri.activityInfo.applicationInfo.loadBanner(pm);
-            Drawable icon = ri.loadIcon(pm);
+            // The icon is only shown on a tile that has no banner; loading it for the rest is wasted work.
+            Drawable icon = banner == null ? ri.loadIcon(pm) : null;
             String label = String.valueOf(ri.loadLabel(pm));
-            fresh.add(new Entry(label, new ComponentName(pkg, ri.activityInfo.name), banner, icon));
+            fresh.add(entry(label, new ComponentName(pkg, ri.activityInfo.name), banner, icon));
         }
         Collections.sort(fresh, (a, b) -> {
             int fa = favourites.indexOf(a.pkg), fb = favourites.indexOf(b.pkg);
@@ -138,13 +201,21 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         // Optional "Default home" tile (config.xml), only when this TV actually has a home-screen picker.
         if (showHomeSettings
                 && pm.resolveActivity(new Intent(Settings.ACTION_HOME_SETTINGS), 0) != null) {
-            fresh.add(new Entry(ctx.getString(R.string.home_settings),
+            fresh.add(entry(ctx.getString(R.string.home_settings),
                     new ComponentName(ctx, HomeSettingsActivity.class), null,
                     ctx.getDrawable(R.drawable.ic_home_settings)));
         }
-        items.clear();
-        items.addAll(fresh);
-        notifyDataSetChanged();
+        return fresh;
+    }
+
+    private Entry entry(String label, ComponentName component, Drawable banner, Drawable icon) {
+        String key = component.flattenToShortString();
+        Long id = ids.get(key);
+        if (id == null) {
+            id = nextId++;
+            ids.put(key, id);
+        }
+        return new Entry(label, component, banner, icon, key, id);
     }
 
     @NonNull
@@ -172,6 +243,7 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
     public void onBindViewHolder(@NonNull Holder h, int position) {
         Entry e = items.get(position);
         h.name.setText(e.label);
+        h.card.setContentDescription(e.label);   // the tile's own text is hidden until focus, so TalkBack needs this
         h.name.setVisibility(position < dockSize ? View.INVISIBLE : View.VISIBLE);   // the dock has no labels
         boolean focused = h.card.isFocused();   // a rebind after reload() can hit the focused tile
         h.name.setAlpha(focused ? 1f : 0f);
@@ -226,19 +298,19 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
 
     @Override
     public long getItemId(int position) {
-        return items.get(position).component.flattenToShortString().hashCode();
+        return items.get(position).id;
     }
 
     /** Stable key for the app at a position (its component), or null. */
     String keyAt(int position) {
-        return position >= 0 && position < items.size() ? items.get(position).component.flattenToShortString() : null;
+        return position >= 0 && position < items.size() ? items.get(position).key : null;
     }
 
     /** Position of the app with this key, or -1 when it is gone. */
     int positionOf(String key) {
         if (key == null) return -1;
         for (int i = 0; i < items.size(); i++) {
-            if (items.get(i).component.flattenToShortString().equals(key)) return i;
+            if (items.get(i).key.equals(key)) return i;
         }
         return -1;
     }

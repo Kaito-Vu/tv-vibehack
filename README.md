@@ -191,7 +191,11 @@ Windows venv and disable MSYS path rewriting themselves.
 
 A small native Android TV app (`com.gathin.tvhome`, about 250 KB installed), written in plain Java with
 AndroidX RecyclerView and nothing heavier. It is built for sets with 1 GB of RAM: no blur, no
-video, no network, no background services.
+video, no internet access (the app has no `INTERNET` permission) and nothing running in the background.
+The only services are optional and off unless you turn them on: the Clock screensaver, and two
+accessibility services that route the remote's Home and Input buttons (they see key presses, not the
+screen). It asks for the location permission only because Android hides the Wi-Fi network name
+without it, and the name never leaves the TV.
 
 **Configure** it in [`launcher/app/src/main/res/values/config.xml`](launcher/app/src/main/res/values/config.xml):
 the dock order, apps to hide, your TV's Live TV package, the number of columns (tiles shrink to fit

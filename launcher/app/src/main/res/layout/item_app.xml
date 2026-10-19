@@ -59,6 +59,7 @@
         android:singleLine="true"
         android:ellipsize="end"
         android:alpha="0"
+        android:importantForAccessibility="no"
         android:translationY="-6dp"
         android:textColor="#F2FFFFFF"
         android:textSize="14sp"

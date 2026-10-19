@@ -30,6 +30,8 @@ final class Config {
     private static final String TAG = "TvHome.Config";
     static final String FILE_NAME = "config.json";
     static final String WALLPAPER_NAME = "wallpaper.jpg";
+    /** A bigger file is ignored: it would only slow down or exhaust a 1 GB TV. */
+    private static final long MAX_WALLPAPER_BYTES = 16L * 1024 * 1024;
 
     final List<String> dockApps;
     final List<String> hiddenApps;
@@ -109,7 +111,7 @@ final class Config {
             background = color(json, "background_color", background);
         }
         File wallpaper = dir != null ? new File(dir, WALLPAPER_NAME) : null;
-        if (wallpaper != null && !(wallpaper.isFile() && wallpaper.length() > 0)) wallpaper = null;
+        if (wallpaper != null && !(wallpaper.isFile() && wallpaper.length() > 0 && wallpaper.length() <= MAX_WALLPAPER_BYTES)) wallpaper = null;
         // A theme can also switch the wallpaper off while the file is still there.
         if (json != null && json.has("wallpaper") && !bool(json, "wallpaper", true)) wallpaper = null;
 
@@ -130,7 +132,7 @@ final class Config {
             int n = 0, r;
             while (n < buf.length && (r = in.read(buf, n, buf.length - n)) > 0) n += r;
             String text = new String(buf, 0, n, StandardCharsets.UTF_8);
-            if (text.startsWith("﻿")) text = text.substring(1);   // Windows editors add a BOM
+            if (text.startsWith("\uFEFF")) text = text.substring(1);   // Windows editors add a BOM
             return new JSONObject(text);
         } catch (Exception e) {
             Log.w(TAG, "ignoring " + file + ": " + e.getMessage());
@@ -151,8 +153,8 @@ final class Config {
     private static int integer(JSONObject o, String key, int fallback, int min, int max) {
         Object v = o.opt(key);
         if (!(v instanceof Number)) return fallback;
-        int i = ((Number) v).intValue();
-        return i < min || i > max ? fallback : i;
+        long l = ((Number) v).longValue();   // longValue, so 4294967300 can't wrap into range
+        return l < min || l > max ? fallback : (int) l;
     }
 
     private static int color(JSONObject o, String key, int fallback) {
