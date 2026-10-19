@@ -5,11 +5,14 @@
 # Usage: TV_HOST=192.168.1.50 tools/restore.sh examples/xiaomi-mi-tv-4a/debloat.txt [stock.launcher.package]
 # Without the second argument it looks for a known stock launcher that is currently disabled.
 set -euo pipefail
-cd "$(dirname "$0")/.."
 LIST="${1:?usage: restore.sh <debloat list> [stock launcher package]}"
+# Make a relative path absolute before changing directory, so it means what it did where the user typed it.
+[ -f "$LIST" ] || { echo "ERROR: cannot read $LIST" >&2; exit 1; }
+LIST="$(cd "$(dirname "$LIST")" && pwd)/$(basename "$LIST")"
+cd "$(dirname "$0")/.."
 PY=tools/venv/bin/python
 [ -x "$PY" ] || PY=tools/venv/Scripts/python.exe
-[ -x "$PY" ] || { echo "run: python3 -m venv tools/venv && tools/venv/bin/pip install -r tools/requirements.txt"; exit 1; }
+[ -x "$PY" ] || { echo "run: python3 -m venv tools/venv && tools/venv/bin/pip install -r tools/requirements.txt" >&2; exit 1; }
 export MSYS_NO_PATHCONV=1
 . tools/pkglist.sh
 PKGS=$(pkg_list "$LIST")   # exits here, before touching the TV, if the list is not clean
@@ -19,7 +22,9 @@ if [ -z "$STOCK" ]; then
   DISABLED=$("$PY" -I tools/tv.py 'pm list packages -d' | tr -d '\r')
   STOCK=com.google.android.tvlauncher
   for c in com.google.android.apps.tv.launcherx com.google.android.tvlauncher com.google.android.leanbacklauncher; do
-    case "$DISABLED" in *"package:$c"*) STOCK=$c; break ;; esac
+    # Whole-line match: "package:...leanbacklauncher" is also the start of "...leanbacklauncher.recommendations",
+    # which every Android TV list disables, so a substring test would pick a launcher that is still enabled.
+    if grep -qxF "package:$c" <<<"$DISABLED"; then STOCK=$c; break; fi
   done
   echo "Stock launcher: $STOCK (pass it as the second argument to choose another)"
 fi

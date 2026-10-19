@@ -12,6 +12,9 @@ $ErrorActionPreference = 'Stop'
 $OutputEncoding = New-Object System.Text.UTF8Encoding $false
 if (-not $TvHost) { throw 'pass -TvHost <tv ip> or set $env:TV_HOST' }
 $env:TV_HOST = $TvHost
+# Make a relative theme folder absolute before changing directory, so themes\aurora means the folder next to
+# where the user ran this.
+if ($Theme) { $Theme = (Resolve-Path -LiteralPath $Theme).Path }
 Set-Location $PSScriptRoot
 $py = 'venv\Scripts\python.exe'
 if (-not (Test-Path $py)) { throw 'run: python -m venv tools\venv; tools\venv\Scripts\python.exe -m pip install -r tools\requirements.txt' }

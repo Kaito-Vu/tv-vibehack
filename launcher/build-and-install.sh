@@ -66,6 +66,7 @@ case "$INSTALL_OUT" in
     echo "ERROR: pm install failed; the stock launcher was left untouched." >&2
     case "$INSTALL_OUT" in
       *UPDATE_INCOMPATIBLE*) echo "An older build signed with a different key is installed. Remove it first (tools/tv.py 'pm uninstall com.gathin.tvhome'), then run this script again." >&2 ;;
+      *) ;;
     esac
     exit 1 ;;
 esac

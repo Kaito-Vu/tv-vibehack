@@ -4,12 +4,15 @@
 #
 # Usage: TV_HOST=192.168.1.50 tools/disable.sh examples/xiaomi-mi-tv-4a/debloat.txt
 set -euo pipefail
-cd "$(dirname "$0")/.."
 LIST="${1:?usage: disable.sh <debloat list>}"
+# Make a relative path absolute before changing directory, so it means what it did where the user typed it.
+[ -f "$LIST" ] || { echo "ERROR: cannot read $LIST" >&2; exit 1; }
+LIST="$(cd "$(dirname "$LIST")" && pwd)/$(basename "$LIST")"
+cd "$(dirname "$0")/.."
 PY=tools/venv/bin/python
 [ -x "$PY" ] || PY=tools/venv/Scripts/python.exe
 export MSYS_NO_PATHCONV=1
-[ -x "$PY" ] || { echo "run: python3 -m venv tools/venv && tools/venv/bin/pip install -r tools/requirements.txt"; exit 1; }
+[ -x "$PY" ] || { echo "run: python3 -m venv tools/venv && tools/venv/bin/pip install -r tools/requirements.txt" >&2; exit 1; }
 . tools/pkglist.sh
 PKGS=$(pkg_list "$LIST")   # exits here, before touching the TV, if the list is not clean
 {
