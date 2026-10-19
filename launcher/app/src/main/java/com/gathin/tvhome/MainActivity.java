@@ -113,6 +113,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     /** Bumped on every resume and Home press: a focus restore queued before that is out of date and does nothing. */
     private int focusGeneration;
     private boolean inputsChecked;
+    /** Height of one grid row, set once the grid is measured; read by the layout manager's extra layout space. */
+    private int extraRowPx;
     /** Rescans the app list a moment after a package changed while Home is showing, so a removed app's tile goes away. */
     private final Runnable refreshApps = new Runnable() {
         @Override
@@ -223,7 +225,17 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         vpnApp = cfg.vpnApp;
 
         grid = findViewById(R.id.grid);
-        grid.setLayoutManager(new GridLayoutManager(this, COLUMNS));
+        // Keep one more row laid out below (and above) the visible ones. Holding Down then always finds the next
+        // tile already attached and focuses it directly, instead of scrolling first and focusing when the scroll
+        // settles, which never happens while the key keeps repeating.
+        grid.setLayoutManager(new GridLayoutManager(this, COLUMNS) {
+            @Override
+            protected void calculateExtraLayoutSpace(@NonNull RecyclerView.State state, @NonNull int[] extra) {
+                super.calculateExtraLayoutSpace(state, extra);
+                extra[0] = Math.max(extra[0], extraRowPx);
+                extra[1] = Math.max(extra[1], extraRowPx);
+            }
+        });
         grid.setHasFixedSize(true);
         grid.setItemAnimator(null);
         grid.setItemViewCacheSize(8);                       // two rows stay attached-ready: scrolling a row inflates nothing
@@ -242,6 +254,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             // Item height follows the tile size, which follows the column count (AppAdapter.tileWidthPx).
             int inner = (r - l) - grid.getPaddingLeft() - grid.getPaddingRight();
             int itemH = AppAdapter.itemHeightPx(AppAdapter.tileHeightPx(AppAdapter.tileWidthPx(inner, COLUMNS, density)), density);
+            extraRowPx = itemH;
             int dockRow = itemH + (int) ((6 + 12) * density);   // item height plus DockDecoration offsets
             int gridRows = itemH * rowsBelowDock;
             int want = Math.max(0, h - dockRow - gridRows - (int) (30 * density));
@@ -389,8 +402,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
 
     /**
      * A theme's full-screen picture behind everything. Decoded once off the main thread (a 4K JPEG takes
-     * a while on a weak CPU) and faded in when ready, downsampled so it never costs more than about 4
-     * megabytes at RGB_565 on a 1080p screen; the plain colour shows until then.
+     * a while on a weak CPU) and faded in when ready, downsampled so it never costs more than about 8
+     * megabytes at RGB_565 on a 1080p screen (usually about 4); the plain colour shows until then.
      */
     private void showWallpaper(File file) {
         final android.util.DisplayMetrics dm = getResources().getDisplayMetrics();

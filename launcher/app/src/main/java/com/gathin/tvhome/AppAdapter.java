@@ -82,6 +82,10 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         }
     }
 
+    /** Interpolators keep no state, so one instance serves every tile instead of one per focus change. */
+    private static final OvershootInterpolator POP = new OvershootInterpolator(1.6f);
+    private static final OvershootInterpolator LINEAR_OUT = new OvershootInterpolator(0f);
+
     static final float FOCUS_SCALE = 1.10f;
     /** Design size of a tile (dp); tiles shrink from here when the columns don't fit, see tileWidthPx. */
     static final float DESIGN_W_DP = 180f, DESIGN_H_DP = 101f;
@@ -235,6 +239,11 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
             }
             return a.label.compareToIgnoreCase(b.label);
         });
+        // The dock's glow colours, sampled here once so the first focus on a dock tile doesn't do it on the main thread.
+        for (int i = 0; i < Math.min(dockSize, fresh.size()); i++) {
+            Entry e = fresh.get(i);
+            e.ambient = vividColor(e.banner != null ? e.banner : e.icon);
+        }
         // Optional "Default home" tile (config.xml), only when this TV actually has a home-screen picker.
         if (showHomeSettings
                 && pm.resolveActivity(new Intent(Settings.ACTION_HOME_SETTINGS), 0) != null) {
@@ -470,7 +479,7 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
                 float s = focused ? FOCUS_SCALE : 1.0f;
                 view.animate().scaleX(s).scaleY(s)
                         .setDuration(focused ? 260 : 180)
-                        .setInterpolator(new OvershootInterpolator(focused ? 1.6f : 0f))
+                        .setInterpolator(focused ? POP : LINEAR_OUT)
                         .start();
                 name.animate().alpha(focused ? 1f : 0f)
                         .translationY(focused ? density * 4f : -density * 6f)
