@@ -110,6 +110,26 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private RecyclerView.OnScrollListener pendingFocus;
     private boolean netCallbacksRegistered, inputCallbackRegistered;
     private final Runnable wifiUpdate = this::updateWifiLabel;
+    /** Bumped on every resume and Home press: a focus restore queued before that is out of date and does nothing. */
+    private int focusGeneration;
+    private boolean inputsChecked;
+    /** Rescans the app list a moment after a package changed while Home is showing, so a removed app's tile goes away. */
+    private final Runnable refreshApps = new Runnable() {
+        @Override
+        public void run() {
+            if (!resumed || isDestroyed()) return;
+            final int gen = ++focusGeneration;
+            final String key = lastFocusedKey;
+            final int slot = lastFocused;
+            adapter.reload(() -> {
+                if (isDestroyed()) return;
+                updateInputsButton();
+                afterNextDraw(() -> {
+                    if (gen == focusGeneration) restoreFocus(key, slot);
+                });
+            });
+        }
+    };
 
     /** Refreshes the network pill when the connection changes: at boot Wi-Fi often connects after Home is shown. */
     private final class StatusCallback extends ConnectivityManager.NetworkCallback {
@@ -132,7 +152,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private final BroadcastReceiver packageReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (adapter != null) adapter.markDirty();
+            if (adapter == null) return;
+            adapter.markDirty();
+            if (resumed) {   // a burst of changes (an app update touches several broadcasts) becomes one rescan
+                handler.removeCallbacks(refreshApps);
+                handler.postDelayed(refreshApps, 1500);
+            }
         }
     };
     /** Shows the Inputs pill once the TV registers an input: at boot HDMI inputs can appear after Home is shown. */
@@ -180,6 +205,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         ambientGlow.setGradientType(GradientDrawable.RADIAL_GRADIENT);
         ambientGlow.setGradientCenter(0.32f, 0.42f);
         ambient.setBackground(ambientGlow);
+        // One drawable, nothing overlaps: tell the renderer so a fade multiplies alpha straight into the paint
+        // instead of drawing the full-screen glow into an 8 MB offscreen layer first.
+        ambient.forceHasOverlappingRendering(false);
         ambient.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) ->
                 ambientGlow.setGradientRadius((r - l) * 0.62f));
         greeting = findViewById(R.id.greeting);
@@ -198,6 +226,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         grid.setLayoutManager(new GridLayoutManager(this, COLUMNS));
         grid.setHasFixedSize(true);
         grid.setItemAnimator(null);
+        grid.setItemViewCacheSize(8);                       // two rows stay attached-ready: scrolling a row inflates nothing
+        grid.getRecycledViewPool().setMaxRecycledViews(0, 12);
         grid.addItemDecoration(new DockDecoration(COLUMNS, density));
         grid.setLayoutAnimation(new LayoutAnimationController(
                 AnimationUtils.loadAnimation(this, R.anim.tile_enter), 0.06f));
@@ -365,6 +395,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private void showWallpaper(File file) {
         final android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
         new Thread(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT + android.os.Process.THREAD_PRIORITY_LESS_FAVORABLE);
             try {
                 android.graphics.BitmapFactory.Options opts = new android.graphics.BitmapFactory.Options();
                 opts.inJustDecodeBounds = true;
@@ -407,19 +438,24 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         ambient.animate().cancel();
         ambient.setAlpha(0f);
         updateGreeting();
-        updateWifiLabel();
-        updateInputsButton();
+        // The network callbacks (registered in onStart) report the current state right away, so asking
+        // again here would just repeat a handful of binder calls on the way back to Home.
+        if (!netCallbacksRegistered) updateWifiLabel();
+        if (!inputsChecked) {   // after that it changes only with an input or a package: see inputCallback, onReload
+            inputsChecked = true;
+            updateInputsButton();
+        }
         handler.removeCallbacks(minuteTick);
         handler.postDelayed(minuteTick, MINUTE_MS);
 
         // Read these before reload(): rebinding can move focus to the first tile and overwrite them.
         final String returnKey = lastFocusedKey;
         final int returnSlot = lastFocused;
+        final int gen = ++focusGeneration;
         // Return to the app we left from, or the same slot if that app is gone. Always refocus: after
         // a reload the view that holds focus may no longer show the app it had.
         final Runnable focusNow = () -> {
-            int pos = adapter.positionOf(returnKey);
-            focusTile(pos >= 0 ? pos : returnSlot);
+            if (gen == focusGeneration && !isDestroyed()) restoreFocus(returnKey, returnSlot);
         };
         if (adapter.isDirty() || adapter.getItemCount() == 0) {
             // Only rescan the apps when something was installed, removed or changed (see packageReceiver);
@@ -430,12 +466,24 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                     grid.scheduleLayoutAnimation();   // the entrance animation plays once, not on every return
                     firstShow = false;
                 }
+                updateInputsButton();   // the Live TV app may have come or gone with the packages
                 // The new tiles are laid out in the next frame; focusing before that finds no views.
                 afterNextDraw(focusNow);
             });
         } else {
             grid.post(focusNow);
         }
+    }
+
+    /**
+     * Puts focus back on the tile the user left from. It does nothing when they have already moved to the top
+     * bar, and follows them when they have already moved to another tile, so a slow scan never undoes a key press.
+     */
+    private void restoreFocus(String key, int slot) {
+        View f = getCurrentFocus();
+        if (f != null && f.getId() != R.id.card) return;
+        int pos = adapter.positionOf(f != null ? lastFocusedKey : key);
+        focusTile(pos >= 0 ? pos : slot);
     }
 
     @Override
@@ -453,6 +501,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         // Home pressed while Home is already showing: close the menu and go back to the dock. (Coming back
         // from another app also arrives here, but then onResume restores the tile we left from.)
         if (resumed) {
+            focusGeneration++;   // a restore still waiting for a scan must not pull focus back
             dismissInputs();
             focusTile(0);
         }
@@ -466,7 +515,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         } catch (RuntimeException ignored) {
         }
         handler.removeCallbacksAndMessages(null);
-        adapter.shutdown();
+        if (adapter != null) adapter.shutdown();
     }
 
     @Override
@@ -482,11 +531,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             public boolean onPreDraw() {
                 ViewTreeObserver now = grid.getViewTreeObserver();
                 if (now.isAlive()) now.removeOnPreDrawListener(this);
-                r.run();
+                // Not run here: focusing resizes the glass, which asks for another layout in the middle of this one.
+                grid.post(r);
                 return true;
             }
         });
-        grid.requestLayout();   // make sure there is a frame coming even if nothing else changed
     }
 
     private void dismissInputs() {
@@ -570,7 +619,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             heroName.setTranslationX(0f);
             heroName.animate().alpha(1f).setDuration(260).start();
             setAmbient(color);
-            ambient.animate().alpha(1f).setDuration(600).withLayer().start();
+            ambient.animate().alpha(1f).setDuration(600).start();
             heroShown = true;
         } else if (changed) {
             heroName.animate().alpha(0f).translationX(-12 * density).setDuration(120).withEndAction(() -> {
@@ -580,9 +629,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                 heroName.animate().alpha(1f).translationX(0f).setDuration(200).start();
             }).start();
             if (color != ambientColor) {
-                ambient.animate().alpha(0.35f).setDuration(200).withLayer().withEndAction(() -> {
+                ambient.animate().alpha(0.35f).setDuration(200).withEndAction(() -> {
                     setAmbient(color);
-                    ambient.animate().alpha(1f).setDuration(500).withLayer().start();
+                    ambient.animate().alpha(1f).setDuration(500).start();
                 }).start();
             }
         } else {
@@ -603,7 +652,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (!heroShown) return;
         heroShown = false;
         heroName.animate().alpha(0f).setDuration(160).start();
-        ambient.animate().alpha(0f).setDuration(300).withLayer().start();
+        ambient.animate().alpha(0f).setDuration(300).start();
     }
 
     private void hideGlass() {

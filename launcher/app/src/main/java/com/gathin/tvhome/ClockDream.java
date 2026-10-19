@@ -1,7 +1,6 @@
 package com.gathin.tvhome;
 
 import android.animation.ArgbEvaluator;
-import android.animation.ValueAnimator;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
@@ -27,7 +26,12 @@ public class ClockDream extends DreamService {
     private GradientDrawable glow;
     private int colorIndex;
     private int glowColor;
-    private ValueAnimator glowAnim;
+    private final ArgbEvaluator argb = new ArgbEvaluator();
+    private static final int GLOW_STEPS = 40;          // 8 s in 200 ms steps
+    private static final long GLOW_STEP_MS = 200L;
+    private int glowStep;
+    private int glowFrom, glowTo;
+    private boolean glowRunning;
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -84,10 +88,8 @@ public class ClockDream extends DreamService {
     /** Stops the timer and every running animation, so nothing keeps touching the views after the dream ends. */
     private void stopAnimations() {
         handler.removeCallbacks(tick);
-        if (glowAnim != null) {
-            glowAnim.cancel();
-            glowAnim = null;
-        }
+        glowRunning = false;
+        handler.removeCallbacks(glowTick);
         if (content != null) content.animate().cancel();
     }
 
@@ -113,15 +115,31 @@ public class ClockDream extends DreamService {
         }
     }
 
+    /**
+     * Fades the glow to the next colour in 5 steps a second instead of 60. The change takes eight seconds at low
+     * brightness, so the eye cannot tell, but a full-screen gradient is not repainted 480 times a minute on a
+     * screen that stays on all day.
+     */
     private void shiftGlow() {
-        int from = glowColor;
+        glowFrom = glowColor;
         colorIndex = (colorIndex + 1) % PALETTE.length;
-        if (glowAnim != null) glowAnim.cancel();
-        glowAnim = ValueAnimator.ofObject(new ArgbEvaluator(), from, PALETTE[colorIndex]);
-        glowAnim.setDuration(8000);
-        glowAnim.addUpdateListener(a -> setGlow((int) a.getAnimatedValue()));
-        glowAnim.start();
+        glowTo = PALETTE[colorIndex];
+        glowStep = 0;
+        glowRunning = true;
+        handler.removeCallbacks(glowTick);
+        handler.post(glowTick);
     }
+
+    private final Runnable glowTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!glowRunning) return;
+            glowStep++;
+            setGlow((int) argb.evaluate(glowStep / (float) GLOW_STEPS, glowFrom, glowTo));
+            if (glowStep < GLOW_STEPS) handler.postDelayed(this, GLOW_STEP_MS);
+            else glowRunning = false;
+        }
+    };
 
     private void setGlow(int color) {
         glowColor = color;

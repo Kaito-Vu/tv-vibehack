@@ -11,10 +11,13 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Outline;
 import android.graphics.Rect;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
+import android.util.Log;
 import android.provider.Settings;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
@@ -36,6 +39,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -45,6 +49,8 @@ import java.util.concurrent.RejectedExecutionException;
  * the rest is alphabetical.
  */
 public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
+
+    private static final String TAG = "TvHome.Apps";
 
     interface TileListener {
         void onTileFocused(int position, View card);
@@ -112,7 +118,21 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
     private final List<Entry> items = new ArrayList<>();
     private final Map<String, Long> ids = new HashMap<>();   // worker thread only
     private long nextId = 1;                                  // worker thread only
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    // One thread, a hair below the main thread's priority so a scan never competes with drawing. Not
+    // THREAD_PRIORITY_BACKGROUND: that moves the thread to a throttled cgroup and the list would crawl.
+    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(() -> {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT + Process.THREAD_PRIORITY_LESS_FAVORABLE);
+            r.run();
+        }, "tvhome-apps");
+        t.setDaemon(true);
+        return t;
+    });
+    /** A scan is running; further reload() calls wait for it instead of queueing a second one (main thread only). */
+    private boolean building;
+    private final List<Runnable> waiters = new ArrayList<>();
+    /** Banners are redrawn once at this size (the focused tile's) instead of keeping the app's full-size bitmap. */
+    private final int bannerW, bannerH;
     private final Handler main = new Handler(Looper.getMainLooper());
     /** True until the list has been built, and again whenever a package is added, removed or changed. */
     private volatile boolean dirty = true;
@@ -124,6 +144,9 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         this.favourites = cfg.dockApps;
         this.hidden = new HashSet<>(cfg.hiddenApps);
         this.showHomeSettings = cfg.showHomeSettingsShortcut;
+        float density = ctx.getResources().getDisplayMetrics().density;
+        this.bannerW = Math.max(1, Math.round(DESIGN_W_DP * density * FOCUS_SCALE));
+        this.bannerH = Math.max(1, Math.round(DESIGN_H_DP * density * FOCUS_SCALE));
         // Tiles keep their identity across reload(), so a focused tile stays on its app instead of
         // its view being rebound to whatever app now sits in that slot.
         setHasStableIds(true);
@@ -141,35 +164,47 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
     /** Stops the background loader. Call from Activity.onDestroy. */
     void shutdown() {
         worker.shutdownNow();
+        main.removeCallbacksAndMessages(null);
+        waiters.clear();
     }
 
     /**
      * Rebuilds the app list off the main thread (a PackageManager query plus a banner, icon and label
      * per app is too slow for a weak TV CPU), then swaps it in on the main thread and runs {@code done}.
-     * {@code done} also runs when the build fails, so callers can always restore focus.
+     * {@code done} also runs when the build fails, so callers can always restore focus. Calls made while
+     * a scan is running share its result instead of starting another.
      */
     void reload(Runnable done) {
+        if (done != null) waiters.add(done);
+        if (building) return;
+        building = true;
         dirty = false;
         try {
             worker.execute(() -> {
                 List<Entry> fresh = null;
                 try {
                     fresh = build();
-                } catch (RuntimeException e) {
-                    dirty = true;   // try again next time instead of showing a half-built list
+                } catch (Throwable t) {   // OutOfMemoryError included: an uncaught Error would kill the process
+                    dirty = true;          // try again next time instead of showing a half-built list
+                    Log.w(TAG, "app scan failed", t);
                 }
+                if (worker.isShutdown()) return;
                 final List<Entry> result = fresh;
                 main.post(() -> {
+                    building = false;
                     if (result != null) {
                         items.clear();
                         items.addAll(result);
                         notifyDataSetChanged();
                     }
-                    if (done != null) done.run();
+                    List<Runnable> run = new ArrayList<>(waiters);
+                    waiters.clear();
+                    for (Runnable r : run) r.run();
                 });
             });
         } catch (RejectedExecutionException e) {
-            // Shut down with the activity; nothing to show.
+            building = false;   // shut down with the activity; nothing to show
+            waiters.clear();
         }
     }
 
@@ -179,11 +214,13 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
         List<ResolveInfo> found = pm.queryIntentActivities(probe, 0);
         List<Entry> fresh = new ArrayList<>();
         for (ResolveInfo ri : found) {
+            if (Thread.currentThread().isInterrupted()) throw new CancellationException();   // activity gone: stop early
             if (ri.activityInfo == null) continue;
             String pkg = ri.activityInfo.packageName;
             if (pkg.equals(ctx.getPackageName()) || hidden.contains(pkg)) continue;
             Drawable banner = ri.activityInfo.loadBanner(pm);
             if (banner == null) banner = ri.activityInfo.applicationInfo.loadBanner(pm);
+            if (banner != null) banner = shrink(banner);
             // The icon is only shown on a tile that has no banner; loading it for the rest is wasted work.
             Drawable icon = banner == null ? ri.loadIcon(pm) : null;
             String label = String.valueOf(ri.loadLabel(pm));
@@ -206,6 +243,28 @@ public class AppAdapter extends RecyclerView.Adapter<AppAdapter.Holder> {
                     ctx.getDrawable(R.drawable.ic_home_settings)));
         }
         return fresh;
+    }
+
+    /**
+     * Redraws a bitmap banner at tile size, centre-cropped like the tile's ImageView. Apps ship banners up
+     * to 1280x720 (nearly 4 MB each); a tile never shows more than about 0.35 MB of it. Vector and other
+     * drawables are kept as they are.
+     */
+    private Drawable shrink(Drawable d) {
+        if (!(d instanceof BitmapDrawable)) return d;
+        int iw = d.getIntrinsicWidth(), ih = d.getIntrinsicHeight();
+        if (iw <= 0 || ih <= 0 || (iw <= bannerW && ih <= bannerH)) return d;
+        try {
+            Bitmap b = Bitmap.createBitmap(bannerW, bannerH, Bitmap.Config.ARGB_8888);
+            float scale = Math.max(bannerW / (float) iw, bannerH / (float) ih);
+            int dw = Math.round(iw * scale), dh = Math.round(ih * scale);
+            int left = (bannerW - dw) / 2, top = (bannerH - dh) / 2;
+            d.setBounds(left, top, left + dw, top + dh);
+            d.draw(new Canvas(b));
+            return new BitmapDrawable(ctx.getResources(), b);
+        } catch (OutOfMemoryError e) {
+            return d;
+        }
     }
 
     private Entry entry(String label, ComponentName component, Drawable banner, Drawable icon) {
